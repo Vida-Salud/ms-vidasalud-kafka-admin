@@ -1,3 +1,63 @@
+server:
+  port: 8095
+
 spring:
+  config:
+    import: optional:file:.env[.properties]   # solo para correr desde el IDE
   application:
     name: ms-vidasalud-kafka-admin
+
+  cloud:
+    azure:
+      active-directory:
+        enabled: true
+        profile:
+          tenant-id: ${AZURE_TENANT_ID}
+        credential:
+          client-id: ${AZURE_CLIENT_ID}
+        app-id-uri: ${AZURE_APP_ID_URI:api://${AZURE_CLIENT_ID}}
+
+  mvc:
+    problemdetails:
+      enabled: true
+    apiversion:
+      use:
+        path-segment: 1   # /api/{version}/...
+      supported: 1
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092,localhost:9093,localhost:9094}
+    client-id: ${spring.application.name}
+    admin:
+      properties:
+        request.timeout.ms: 10000
+        default.api.timeout.ms: 15000
+
+vidasalud:
+  kafka-admin:
+    timeout: 15s                       # espera máxima de cada operación contra el clúster
+    # Tópicos del sistema (infra/kafka/topics.conf): se pueden consultar y ajustar, pero no eliminar.
+    protegidos:
+      - appointments.events
+      - audit.timeline
+      - appointments.events.report.DLT
+      - appointments.events.audit.DLT
+      - audit.timeline.audit.DLT
+    # Configuraciones de tópico que esta API permite fijar. Cualquier otra se rechaza con 400.
+    configuraciones-permitidas:
+      - cleanup.policy
+      - retention.ms
+      - retention.bytes
+      - min.insync.replicas
+      - segment.ms
+      - max.message.bytes
+      - delete.retention.ms
+      - min.compaction.lag.ms
+      - max.compaction.lag.ms
+      - min.cleanable.dirty.ratio
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
