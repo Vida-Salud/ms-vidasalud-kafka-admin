@@ -63,8 +63,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 
 /**
- * Toda la administración de Kafka pasa por aquí: el controlador solo llama métodos de alto nivel y no
- * conoce el AdminClient. Cada operación espera como máximo {@code vidasalud.kafka-admin.timeout} y
+ * Toda la administración de Kafka pasa por aquí: el controlador solo llama
+ * métodos de alto nivel y no
+ * conoce el AdminClient. Cada operación espera como máximo
+ * {@code vidasalud.kafka-admin.timeout} y
  * traduce los errores de Kafka a excepciones de la API (404, 409, 400, 503).
  */
 @Service
@@ -74,6 +76,12 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
     private static final Set<String> CLEANUP_POLICIES = Set.of("delete", "compact", "compact,delete", "delete,compact");
     private static final String MIN_ISR = "min.insync.replicas";
     private static final String CLEANUP_POLICY = "cleanup.policy";
+    /**
+     * Reintentos del describe posterior a crear, mientras la metadata se propaga
+     * entre los brokers.
+     */
+    private static final int INTENTOS_TRAS_CREAR = 5;
+    private static final long ESPERA_PROPAGACION_MS = 200L;
 
     private final Admin admin;
     private final KafkaAdminProperties properties;
@@ -146,7 +154,41 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
         esperar(admin.createTopics(List.of(nuevo)).all(), "crear el tópico " + nombre);
         log.info("Tópico creado [nombre={}, particiones={}, replicas={}, configs={}]",
                 nombre, request.particiones(), request.replicas(), configs);
-        return detalleTopico(nombre);
+        return detalleTrasCrear(nombre);
+    }
+
+    /**
+     * El tópico ya existe, pero en un clúster de varios brokers la metadata tarda
+     * unos milisegundos en
+     * propagarse: si el describe sale hacia un broker que todavía no se enteró,
+     * responde
+     * {@code UnknownTopicOrPartition} y devolveríamos un 404 por una creación
+     * exitosa. Reintentamos
+     * brevemente en vez de fallar al primer intento.
+     */
+    private TopicoDetalle detalleTrasCrear(String nombre) {
+        for (int intento = 1; intento <= INTENTOS_TRAS_CREAR; intento++) {
+            try {
+                return detalleTopico(nombre);
+            } catch (RecursoNoEncontradoException e) {
+                if (intento == INTENTOS_TRAS_CREAR) {
+                    throw e;
+                }
+                log.debug("Metadata del tópico {} aún no propagada, reintento {}/{}",
+                        nombre, intento, INTENTOS_TRAS_CREAR);
+                esperarPropagacion();
+            }
+        }
+        throw new IllegalStateException("Inalcanzable");
+    }
+
+    private void esperarPropagacion() {
+        try {
+            Thread.sleep(ESPERA_PROPAGACION_MS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new KafkaNoDisponibleException("Interrumpido esperando la metadata del tópico", e);
+        }
     }
 
     @Override
@@ -167,7 +209,8 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
         validarNoReservado(nombre);
         validarClave(clave);
         describir(nombre);
-        alterarConfiguracion(nombre, List.of(new AlterConfigOp(new ConfigEntry(clave, ""), AlterConfigOp.OpType.DELETE)));
+        alterarConfiguracion(nombre,
+                List.of(new AlterConfigOp(new ConfigEntry(clave, ""), AlterConfigOp.OpType.DELETE)));
         log.info("Configuración eliminada, vuelve al valor del broker [topico={}, clave={}]", nombre, clave);
         return detalleTopico(nombre);
     }
@@ -236,7 +279,8 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
                 .sorted(Comparator.comparing(MiembroGrupo::clientId))
                 .toList();
 
-        long lagTotal = offsets.stream().map(OffsetParticion::lag).filter(l -> l != null).mapToLong(Long::longValue).sum();
+        long lagTotal = offsets.stream().map(OffsetParticion::lag).filter(l -> l != null).mapToLong(Long::longValue)
+                .sum();
         return new GrupoDetalle(grupoId, grupo.groupState().name(),
                 grupo.coordinator() != null ? grupo.coordinator().host() + ":" + grupo.coordinator().port() : null,
                 miembros, offsets, lagTotal);
@@ -258,7 +302,8 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
         Map<TopicPartition, OffsetAndMetadata> nuevos = new HashMap<>();
         destino.forEach((tp, offset) -> nuevos.put(tp, new OffsetAndMetadata(offset)));
         esperar(admin.alterConsumerGroupOffsets(grupoId, nuevos).all(), "mover los offsets del grupo " + grupoId);
-        log.warn("Offsets reiniciados [grupo={}, topico={}, posicion={}, offsets={}]", grupoId, topico, posicion, destino);
+        log.warn("Offsets reiniciados [grupo={}, topico={}, posicion={}, offsets={}]", grupoId, topico, posicion,
+                destino);
 
         return destino.entrySet().stream()
                 .map(e -> new OffsetParticion(topico, e.getKey().partition(), e.getValue(), null, null))
@@ -273,7 +318,10 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
                 .get(nombre);
     }
 
-    /** Kafka no responde "no existe" para un grupo desconocido: lo describe en estado DEAD. */
+    /**
+     * Kafka no responde "no existe" para un grupo desconocido: lo describe en
+     * estado DEAD.
+     */
     private ConsumerGroupDescription describirGrupo(String grupoId) {
         ConsumerGroupDescription grupo = esperar(admin.describeConsumerGroups(List.of(grupoId)).all(),
                 "describir el grupo " + grupoId).get(grupoId);
@@ -329,7 +377,10 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
         }
     }
 
-    /** Los tópicos que empiezan con "_" son internos de Kafka (__consumer_offsets, _confluent...). */
+    /**
+     * Los tópicos que empiezan con "_" son internos de Kafka (__consumer_offsets,
+     * _confluent...).
+     */
     private static void validarNoReservado(String nombre) {
         if (nombre.startsWith("_")) {
             throw new DatoInvalidoException("El tópico " + nombre + " es interno de Kafka");
@@ -366,12 +417,13 @@ public class KafkaAdminServiceImpl implements KafkaAdminService {
             case GroupNotEmptyException e -> new ConflictoException("El grupo tiene consumidores activos", e);
             case UnknownMemberIdException e -> new ConflictoException("El grupo tiene consumidores activos", e);
             case InvalidPartitionsException e -> new DatoInvalidoException(detalle, e);
-            case InvalidConfigurationException e -> new DatoInvalidoException(detalle, e);   // incluye réplicas inválidas
+            case InvalidConfigurationException e -> new DatoInvalidoException(detalle, e); // incluye réplicas inválidas
             case PolicyViolationException e -> new DatoInvalidoException(detalle, e);
             case InvalidRequestException e -> new DatoInvalidoException(detalle, e);
             case RetriableException e -> new KafkaNoDisponibleException(
                     "Kafka no está disponible al " + operacion + ": " + detalle, e);
-            case null, default -> new IllegalStateException("Error inesperado de Kafka al " + operacion + ": " + detalle, causa);
+            case null, default ->
+                new IllegalStateException("Error inesperado de Kafka al " + operacion + ": " + detalle, causa);
         };
     }
 }
